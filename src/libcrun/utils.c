@@ -43,7 +43,7 @@
 #include <stdarg.h>
 
 #ifndef CLOSE_RANGE_CLOEXEC
-# define CLOSE_RANGE_CLOEXEC (1U << 2)
+#  define CLOSE_RANGE_CLOEXEC (1U << 2)
 #endif
 #ifndef RESOLVE_IN_ROOT
 #  define RESOLVE_IN_ROOT 0x10
@@ -362,6 +362,15 @@ fallback:
   while (*path_in_chroot == '/')
     path_in_chroot++;
 
+  /* If the path is empty we are at the root, dup the dirfd itself.  */
+  if (path_in_chroot[0] == '\0')
+    {
+      ret = dup (dirfd);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, errno, "dup `%s`", rootfs);
+      return ret;
+    }
+
   ret = openat (dirfd, path_in_chroot, flags, mode);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "open `%s`", path);
@@ -427,8 +436,10 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
             depth--;
           else
             {
+              /* Start from the root.  */
               close_and_reset (&wd_cleanup);
               cwd = dirfd;
+              goto next;
             }
         }
 
@@ -451,8 +462,7 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
                       resolved_path = xrealloc (resolved_path, resolved_size);
 
                       s = readlinkat (dirfd, npath, resolved_path, resolved_size);
-                    }
-                  while (s == resolved_size);
+                  } while (s == resolved_size);
 
                   if (s > 0)
                     {
@@ -1036,8 +1046,7 @@ copy_from_fd_to_fd (int src, int dst, int consume, libcrun_error_t *err)
             return crun_make_error (err, errno, "write");
           remaining -= ret;
         }
-    }
-  while (consume && nread);
+  } while (consume && nread);
 
   return 0;
 }
@@ -1824,8 +1833,7 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
               size = readlinkat (dirfd (dsrcfd), de->d_name, target_buf, buf_size);
               if (UNLIKELY (size < 0))
                 return crun_make_error (err, errno, "readlink `%s/%s`", srcname, de->d_name);
-            }
-          while (size == buf_size);
+          } while (size == buf_size);
 
           ret = symlinkat (target_buf, destdirfd, de->d_name);
           if (UNLIKELY (ret < 0))
@@ -1984,7 +1992,7 @@ append_paths (char **out, libcrun_error_t *err, ...)
       bool has_trailing_slash;
 
       has_trailing_slash = copied > 0 && (*out)[copied - 1] == '/';
-      if (i > 0 && !has_trailing_slash)
+      if (i > 0 && ! has_trailing_slash)
         {
           (*out)[copied] = '/';
           copied += 1;
@@ -1995,4 +2003,61 @@ append_paths (char **out, libcrun_error_t *err, ...)
     }
   (*out)[copied] = '\0';
   return 0;
+}
+
+/* Adapted from mailutils 0.6.91 (distributed under LGPL 2.0+)  */
+static int
+b64_input (char c)
+{
+  const char table[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int i;
+
+  for (i = 0; i < 64; i++)
+    {
+      if (table[i] == c)
+        return i;
+    }
+  return -1;
+}
+
+int
+base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t *nbytes)
+{
+  int i = 0, tmp = 0, pad = 0;
+  size_t consumed = 0;
+  unsigned char data[4];
+
+  *nbytes = 0;
+  while (consumed < isize && (*nbytes) + 3 < osize)
+    {
+      while ((i < 4) && (consumed < isize))
+        {
+          tmp = b64_input (*iptr++);
+          consumed++;
+          if (tmp != -1)
+            data[i++] = tmp;
+          else if (*(iptr - 1) == '=')
+            {
+              data[i++] = '\0';
+              pad++;
+            }
+        }
+
+      /* I have a entire block of data 32 bits get the output data.  */
+      if (i == 4)
+        {
+          *optr++ = (data[0] << 2) | ((data[1] & 0x30) >> 4);
+          *optr++ = ((data[1] & 0xf) << 4) | ((data[2] & 0x3c) >> 2);
+          *optr++ = ((data[2] & 0x3) << 6) | data[3];
+          (*nbytes) += 3 - pad;
+        }
+      else
+        {
+          /* I did not get all the data.  */
+          consumed -= i;
+          return consumed;
+        }
+      i = 0;
+    }
+  return consumed;
 }

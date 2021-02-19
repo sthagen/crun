@@ -14,14 +14,16 @@ test -e Makefile && make distclean
 make -j $(nproc)
 
 VERSION=$($(dirname $0)/git-version-gen --prefix "" .)
-
 if test x$SKIP_CHECKS = x; then
     grep $VERSION NEWS
 fi
 
-OUTDIR=release-$VERSION
+OUTDIR=${OUTDIR:-release-$VERSION}
+if test -e $OUTDIR; then
+    echo "the directory $OUTDIR already exists" >&2
+    exit 1
+fi
 
-rm -rf $OUTDIR
 mkdir -p $OUTDIR
 
 rm -f crun-*.tar*
@@ -53,6 +55,12 @@ rm -rf result
 $RUNTIME run --rm --privileged -v /nix:/nix -v ${PWD}:${PWD} -w ${PWD} nixos/nix \
     nix --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/default-arm64.nix
 cp ./result/bin/crun $OUTDIR/crun-$VERSION-linux-arm64
+
+rm -rf result
+
+$RUNTIME run --rm --privileged -v /nix:/nix -v ${PWD}:${PWD} -w ${PWD} nixos/nix \
+    nix --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/default-arm64.nix --arg enableSystemd false
+cp ./result/bin/crun $OUTDIR/crun-$VERSION-linux-arm64-disable-systemd
 
 rm -rf result
 

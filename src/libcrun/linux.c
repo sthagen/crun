@@ -298,19 +298,49 @@ syscall_pidfd_send_signal (int pidfd, int sig, siginfo_t *info, unsigned int fla
 }
 
 int
-libcrun_create_keyring (const char *name, libcrun_error_t *err)
+libcrun_create_keyring (const char *name, const char *label, libcrun_error_t *err)
 {
-  int ret = syscall_keyctl_join (name);
+  const char *const keycreate = "/proc/self/attr/keycreate";
+  cleanup_close int labelfd = -1;
+  bool label_set = false;
+  int ret;
+
+  if (label)
+    {
+      labelfd = open (keycreate, O_WRONLY | O_CLOEXEC);
+      if (UNLIKELY (labelfd < 0))
+        {
+          if (errno != ENOENT)
+            return crun_make_error (err, errno, "open `%s`", keycreate);
+        }
+      else
+        {
+          ret = write (labelfd, label, strlen (label));
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "write to `%s`", keycreate);
+
+          label_set = true;
+        }
+    }
+
+  ret = syscall_keyctl_join (name);
   if (UNLIKELY (ret < 0))
     {
       if (errno == ENOSYS)
         {
           libcrun_warning ("could not create a new keyring: keyctl_join is not supported");
-          return 0;
+          ret = 0;
+          goto out;
         }
-      return crun_make_error (err, errno, "create keyring `%s`", name);
+      ret = crun_make_error (err, errno, "create keyring `%s`", name);
+      goto out;
     }
-  return 0;
+
+out:
+  /* Best effort attempt to reset the SELinux label used for new keyrings.  */
+  if (label_set)
+    write (labelfd, "", 0);
+  return ret;
 }
 
 static void
@@ -816,7 +846,6 @@ do_mount_cgroup_v1 (libcrun_container_t *container, const char *source, int targ
                     unsigned long mountflags, libcrun_error_t *err)
 {
   int ret;
-  const cgroups_subsystem_t *subsystems = NULL;
   cleanup_free char *content = NULL;
   char *from;
   cleanup_close int tmpfsdirfd = -1;
@@ -826,10 +855,6 @@ do_mount_cgroup_v1 (libcrun_container_t *container, const char *source, int targ
 #if CLONE_NEWCGROUP
   has_cgroupns = get_private_data (container)->unshare_flags & CLONE_NEWCGROUP;
 #endif
-
-  subsystems = libcrun_get_cgroups_subsystems (err);
-  if (UNLIKELY (subsystems == NULL))
-    return -1;
 
   ret = do_mount (container, source, targetfd, target, "tmpfs", mountflags & ~MS_RDONLY, "size=1024k", LABEL_MOUNT,
                   err);
@@ -1021,16 +1046,23 @@ create_dev (libcrun_container_t *container, int devfd, struct device_s *device, 
   if (binds)
     {
       cleanup_close int fd = -1;
-      const char *rel_path = consume_slashes (device->path);
 
       if (rel_dev)
         {
-          fd = openat (devfd, rel_dev, O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0700);
+          fd = openat (devfd, rel_dev, O_NOFOLLOW | O_CLOEXEC | O_PATH | O_NONBLOCK);
           if (UNLIKELY (fd < 0))
-            return crun_make_error (err, errno, "create device `%s`", device->path);
+            {
+              if (errno == ENOENT)
+                fd = openat (devfd, rel_dev, O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0700);
+
+              if (UNLIKELY (fd < 0))
+                return crun_make_error (err, errno, "create device `%s`", device->path);
+            }
         }
       else
         {
+          const char *rel_path = consume_slashes (device->path);
+
           fd = crun_safe_create_and_open_ref_at (false, rootfsfd, rootfs, rootfs_len, rel_path, 0700, err);
           if (UNLIKELY (fd < 0))
             return fd;
@@ -1809,7 +1841,7 @@ make_parent_mount_private (const char *rootfs, libcrun_error_t *err)
 }
 
 int
-libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_error_t *err)
+libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, set_mounts_cb_t cb, void *cb_data, libcrun_error_t *err)
 {
   int rootfsfd = -1;
   int ret = 0, is_user_ns = 0;
@@ -1889,6 +1921,14 @@ libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_
   if (! get_private_data (container)->mount_dev_from_host)
     {
       ret = create_missing_devs (container, is_user_ns ? true : false, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
+  /* Notify the callback after all the mounts are ready but before making them read-only.  */
+  if (cb)
+    {
+      ret = cb (cb_data, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
@@ -2146,7 +2186,7 @@ libcrun_set_usernamespace (libcrun_container_t *container, pid_t pid, libcrun_er
   cleanup_free char *uid_map = NULL;
   cleanup_free char *gid_map = NULL;
   int uid_map_len, gid_map_len;
-  int ret;
+  int ret = 0;
   runtime_spec_schema_config_schema *def = container->container_def;
 
   if ((get_private_data (container)->unshare_flags & CLONE_NEWUSER) == 0)

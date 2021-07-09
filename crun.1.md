@@ -186,6 +186,9 @@ Delete all the containers that satisfy the specified regex.
 
 crun [global options] exec [options] CONTAINER CMD
 
+**--apparmor**=**PROFILE**
+Set the apparmor profile for the process.
+
 **--console-socket**=**SOCKET**
 Path to a UNIX socket that will receive the ptmx end of the tty for
 the container.
@@ -202,11 +205,17 @@ Detach the container process from the current session.
 **--env**=**ENV**
 Specify an environment variable.
 
+**--no-new-privs**
+Set the no new privileges value for the process.
+
 **--preserve-fds**=**N**
 Additional number of FDs to pass into the container.
 
 **--process**=**FILE**
 Path to a file containing the process JSON configuration.
+
+**--process-label**=**VALUE**
+Set the asm process label for the process commonly used with selinux.
 
 **--pid-file**=**PATH**
 Path to the file that will contain the new process PID.
@@ -245,6 +254,9 @@ By default `table` is used.
 ## SPEC OPTIONS
 
 crun [global options] spec [options]
+
+**-b DIR** **--bundle**=**DIR**
+Path to the root of the bundle dir (default ".").
 
 **--rootless**
 Generate a config.json file that is usable by an unprivileged user.
@@ -396,6 +408,18 @@ made of a single hierarchy `none,name=systemd`.
 It is useful to run on a cgroup v2 system containers using older
 versions of systemd that lack support for cgroup v2.
 
+**Note**: Your container host has to have the cgroup v1 mount already present, otherwise
+this will not work. If you want to run the container rootless, the user it runs under
+has to have permissions to this mountpoint.
+
+For example, as root:
+
+```
+mkdir /sys/fs/cgroup/systemd
+mount cgroup -t cgroup /sys/fs/cgroup/systemd -o none,name=systemd,xattr
+chown -R the_user.the_user /sys/fs/cgroup/systemd
+```
+
 ## `run.oci.timens_offset=ID SEC NSEC`
 
 Specify the offset to be written to /proc/self/timens_offsets when creating
@@ -420,6 +444,24 @@ e.g.
 ```
 /sys/fs/cgroup//system.slice/foo-352700.scope/container
 ```
+
+## `run.oci.delegate-cgroup=DELEGATED-CGROUP`
+
+If the `run.oci.systemd.subgroup` annotation is specified, yet another
+sub-cgroup is created and the container process is moved here.
+
+```
+/sys/fs/cgroup/$PATH/$SUBGROUP/$DELEGATED-CGROUP
+```
+
+The runtime doesn't apply any limit to the `$DELEGATED-CGROUP`
+sub-cgroup, the runtime uses only `$PATH/$SUBGROUP`.
+
+The container payload fully manages `$DELEGATE-CGROUP`, the limits
+applied to `$PATH/$SUBGROUP` still applies to `$DELEGATE-CGROUP`.
+
+Since cgroup delegation is not safe on cgroup v1, this option is
+supported only on cgroup v2.
 
 ## `run.oci.hooks.stdout=FILE`
 

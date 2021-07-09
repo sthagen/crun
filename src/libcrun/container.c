@@ -237,7 +237,7 @@ static const char spec_file[] = "\
 		\"resources\": {\n\
 			\"devices\": [\n\
 				{\n\
-					\"allow\": \"false\",\n\
+					\"allow\": false,\n\
 					\"access\": \"rwm\"\n\
 				}\n\
 			]\n\
@@ -1043,6 +1043,21 @@ exit:
   return yajl_error_to_crun_error (r, err);
 }
 
+static int
+send_sync_cb (void *data, libcrun_error_t *err)
+{
+  int sync_socket_fd = *((int *) data);
+  int ret;
+
+  /* sync 2.  */
+  ret = sync_socket_send_sync (sync_socket_fd, false, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  /* sync 3.  */
+  return sync_socket_wait_sync (NULL, sync_socket_fd, false, err);
+}
+
 /* Initialize the environment where the container process runs.
    It is used by the container init process.  */
 static int
@@ -1100,17 +1115,8 @@ container_init_setup (void *args, pid_t own_pid, char *notify_socket, int sync_s
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = libcrun_set_mounts (container, rootfs, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  /* sync 2.  */
-  ret = sync_socket_send_sync (sync_socket, false, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  /* sync 3.  */
-  ret = sync_socket_wait_sync (NULL, sync_socket, false, err);
+  /* sync 2 and 3 are sent as part of libcrun_set_mounts.  */
+  ret = libcrun_set_mounts (container, rootfs, send_sync_cb, &sync_socket, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -1441,7 +1447,7 @@ container_init (void *args, char *notify_socket, int sync_socket, libcrun_error_
       _exit (ret);
     }
 
-  execv (exec_path, def->process->args);
+  TEMP_FAILURE_RETRY (execv (exec_path, def->process->args));
 
   if (errno == ENOENT)
     return crun_make_error (err, errno, "exec container process (missing dynamic library?) `%s`", exec_path);
@@ -1664,6 +1670,7 @@ write_container_status (libcrun_container_t *container, libcrun_context_t *conte
                         char *scope, char *created, libcrun_error_t *err)
 {
   cleanup_free char *cwd = getcwd (NULL, 0);
+  cleanup_free char *owner = get_user_name (geteuid ());
   char *external_descriptors = libcrun_get_external_descriptors (container);
   char *rootfs = container->container_def->root ? container->container_def->root->path : "";
   libcrun_container_status_t status = { .pid = pid,
@@ -1672,6 +1679,7 @@ write_container_status (libcrun_container_t *container, libcrun_context_t *conte
                                         .rootfs = rootfs,
                                         .bundle = cwd,
                                         .created = created,
+                                        .owner = owner,
                                         .systemd_cgroup = context->systemd_cgroup,
                                         .detached = context->detach,
                                         .external_descriptors = external_descriptors };
@@ -1950,7 +1958,6 @@ cleanup_watch (libcrun_context_t *context, runtime_spec_schema_config_schema *de
 {
   const char *oom_message = NULL;
   libcrun_error_t tmp_err = NULL;
-  bool terminated = false;
   int ret;
 
   if (init_pid)
@@ -1976,17 +1983,14 @@ cleanup_watch (libcrun_context_t *context, runtime_spec_schema_config_schema *de
         oom_message = "the memory limit could be too low";
 
       kill (init_pid, SIGKILL);
-      terminated = TEMP_FAILURE_RETRY (waitpid (init_pid, NULL, 0)) == init_pid;
+      TEMP_FAILURE_RETRY (waitpid (init_pid, NULL, 0));
     }
 
-  if (! terminated)
+  ret = sync_socket_wait_sync (context, sync_socket, true, &tmp_err);
+  if (UNLIKELY (ret < 0))
     {
-      ret = sync_socket_wait_sync (context, sync_socket, true, &tmp_err);
-      if (UNLIKELY (ret < 0))
-        {
-          crun_error_release (err);
-          *err = tmp_err;
-        }
+      crun_error_release (err);
+      *err = tmp_err;
     }
 
   if (terminal_fd >= 0)
@@ -2074,6 +2078,22 @@ get_root_in_the_userns (runtime_spec_schema_config_schema *def, uid_t host_uid, 
   /* If the uid and the gid are not changed, do not attempt any chown.  */
   if (*uid == host_uid && *gid == host_gid)
     *uid = *gid = -1;
+}
+
+static const char *
+find_delegate_cgroup (libcrun_container_t *container)
+{
+  const char *annotation;
+
+  annotation = find_annotation (container, "run.oci.delegate-cgroup");
+  if (annotation)
+    {
+      if (annotation[0] == '\0')
+        return NULL;
+      return annotation;
+    }
+
+  return NULL;
 }
 
 static const char *
@@ -2200,7 +2220,12 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
 
   if (! context->no_new_keyring)
     {
-      ret = libcrun_create_keyring (container->context->id, err);
+      const char *label = NULL;
+
+      if (def->process)
+        label = def->process->selinux_label;
+
+      ret = libcrun_create_keyring (container->context->id, label, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
@@ -2287,6 +2312,7 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
       .root_gid = root_gid,
       .id = context->id,
       .systemd_subgroup = find_systemd_subgroup (container, cgroup_mode),
+      .delegate_cgroup = find_delegate_cgroup (container),
     };
 
     ret = libcrun_cgroup_enter (&cg, err);
@@ -2919,7 +2945,7 @@ libcrun_container_state (libcrun_context_t *context, const char *id, FILE *out, 
   yajl_gen_string (gen, YAJL_STR (status.created), strlen (status.created));
 
   yajl_gen_string (gen, YAJL_STR ("owner"), strlen ("owner"));
-  yajl_gen_string (gen, YAJL_STR (""), strlen (""));
+  yajl_gen_string (gen, YAJL_STR (status.owner), strlen (status.owner));
 
   {
     size_t i;
@@ -3226,7 +3252,7 @@ libcrun_container_exec (libcrun_context_t *context, const char *id, runtime_spec
       TEMP_FAILURE_RETRY (close (pipefd1));
       pipefd1 = -1;
 
-      execv (exec_path, process->args);
+      TEMP_FAILURE_RETRY (execv (exec_path, process->args));
       libcrun_fail_with_error (errno, "exec");
       _exit (EXIT_FAILURE);
     }
@@ -3529,6 +3555,7 @@ libcrun_container_restore (libcrun_context_t *context, const char *id, libcrun_c
       .root_gid = root_gid,
       .id = context->id,
       .systemd_subgroup = find_systemd_subgroup (container, cgroup_mode),
+      .delegate_cgroup = find_delegate_cgroup (container),
     };
 
     ret = libcrun_cgroup_enter (&cg, err);

@@ -878,12 +878,24 @@ open_unix_domain_client_socket (const char *path, int dgram, libcrun_error_t *er
 {
   struct sockaddr_un addr = {};
   int ret;
-  cleanup_close int fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
+  char name_buf[32];
+  cleanup_close int destfd = -1;
+  cleanup_close int fd = -1;
+
+  fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "error creating UNIX socket");
 
   if (strlen (path) >= sizeof (addr.sun_path))
-    return crun_make_error (err, 0, "invalid path %s specified", path);
+    {
+      destfd = open (path, O_PATH);
+      if (UNLIKELY (destfd < 0))
+        return crun_make_error (err, errno, "error opening `%s`", path);
+
+      sprintf (name_buf, "/proc/self/fd/%d", destfd);
+      path = name_buf;
+    }
+
   strcpy (addr.sun_path, path);
   addr.sun_family = AF_UNIX;
   ret = connect (fd, (struct sockaddr *) &addr, sizeof (addr));
@@ -901,12 +913,16 @@ open_unix_domain_socket (const char *path, int dgram, libcrun_error_t *err)
 {
   struct sockaddr_un addr = {};
   int ret;
+  char name_buf[32];
   cleanup_close int fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "error creating UNIX socket");
 
   if (strlen (path) >= sizeof (addr.sun_path))
-    return crun_make_error (err, 0, "invalid path %s specified", path);
+    {
+      sprintf (name_buf, "/proc/self/fd/%d", fd);
+      path = name_buf;
+    }
   strcpy (addr.sun_path, path);
   addr.sun_family = AF_UNIX;
   ret = bind (fd, (struct sockaddr *) &addr, sizeof (addr));
@@ -1490,7 +1506,7 @@ mark_for_close_fds_ge_than (int n, libcrun_error_t *err)
   ret = syscall_close_range (n, UINT_MAX, CLOSE_RANGE_CLOEXEC);
   if (ret == 0)
     return 0;
-  if (ret < 0 && errno != EINVAL && errno != ENOSYS)
+  if (ret < 0 && errno != EINVAL && errno != ENOSYS && errno != EPERM)
     return crun_make_error (err, errno, "close_range from %d", n);
 
   cfd = open ("/proc/self/fd", O_DIRECTORY | O_RDONLY | O_CLOEXEC);
@@ -2129,4 +2145,15 @@ base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t 
       i = 0;
     }
   return consumed;
+}
+
+char *
+get_user_name (uid_t uid)
+{
+  struct passwd pd;
+  struct passwd *temp_result_ptr;
+  char pwdbuffer[200];
+  if (! getpwuid_r (uid, &pd, pwdbuffer, sizeof (pwdbuffer), &temp_result_ptr))
+    return xstrdup (pd.pw_name);
+  return xstrdup ("");
 }

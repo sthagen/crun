@@ -1,6 +1,5 @@
 # crun
 
-[![Build Status](https://travis-ci.org/containers/crun.svg?branch=master)](https://travis-ci.org/containers/crun)
 [![Coverity Status](https://scan.coverity.com/projects/17787/badge.svg)](https://scan.coverity.com/projects/giuseppe-crun)
 [![Total alerts](https://img.shields.io/lgtm/alerts/g/containers/crun.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/containers/crun/alerts/)
 [![Language grade: C/C++](https://img.shields.io/lgtm/grade/cpp/g/containers/crun.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/containers/crun/context:cpp)
@@ -154,7 +153,10 @@ stripped ELF binary for [glibc](https://www.gnu.org/software/libc).
 To build the binaries by locally installing the nix package manager:
 
 ```console
+$ curl -L https://nixos.org/nix/install | sh
+$ git clone --recursive https://github.com/containers/crun.git && cd crun
 $ nix build -f nix/
+$ ./result/bin/crun --version
 ```
 
 ### Ansible
